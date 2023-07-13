@@ -1,0 +1,78 @@
+{-# LANGUAGE DataKinds #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE OverloadedStrings #-}
+
+module Contract where
+
+import Ledger
+import Ledger.Ada as Ada
+import Ledger.Constraints as Constraints
+import qualified Ledger.Typed.Scripts as Scripts
+import Ledger.Value as Value
+import Playground.Contract
+import Wallet.Emulator.Wallet
+
+-- Define the data type for the policy
+data Policy = Policy
+    { beneficiary :: PubKeyHash
+    , deadline :: Slot
+    , token :: TokenName
+    }
+
+-- Define the type of the script
+instance Scripts.ScriptType Policy where
+    type DatumType Policy = ()
+    type RedeemerType Policy = ()
+
+-- Define the script
+policyScript :: Policy -> Scripts.ScriptInstance Policy
+policyScript policy = Scripts.validator @Policy
+    ($$(PlutusTx.compile [|| \Policy{..} () () -> do
+        -- Check that the transaction is signed by the beneficiary
+        let signedByBeneficiary = txSignedBy (scriptContextTxInfo ctx) beneficiary
+        unless signedByBeneficiary $ throwError "Transaction must be signed by the beneficiary"
+    
+        -- Check that the deadline has passed
+        let pastDeadline = from (deadline <= txInfoValidRange (scriptContextTxInfo ctx))
+        unless pastDeadline $ throwError "Deadline has not passed"
+    
+        -- Check that the beneficiary has the specific token
+        let hasToken = Value.assetClassValueOf (txInfoForge (scriptContextTxInfo ctx)) (AssetClass (ownCurrencySymbol ctx, token)) > 0
+        unless hasToken $ throwError "Beneficiary does not have the specific token"    
+    ||]))
+    $$(PlutusTx.compile [|| wrap ||])
+  where
+    wrap = Scripts.wrapValidator @() @()
+
+-- Define the contract
+lockContract :: Contract () BlockchainActions Text ()
+lockContract = do
+    -- Get the public key of the wallet
+    pkh <- pubKeyHash <$> Contract.ownPubKey
+
+    -- Define the policy
+    let policy = Policy
+            { beneficiary = pkh
+            , deadline = 5
+            , token = "specificPolicyID"
+            }
+
+    -- Define the value
+    let value = Ada.lovelaceValueOf 500
+
+    -- Define the lookups
+    let lookups = Constraints.typedValidatorLookups (policyScript policy) <> Constraints.otherScript (Scripts.validatorScript (policyScript policy))
+
+    -- Define the tx
+    let tx = Constraints.mustPayToTheScript () value <> Constraints.mustValidateIn (from now)
+
+    -- Submit the transaction
+    ledgerTx <- submitTxConstraintsWith @Policy lookups tx
+
+    -- Wait for confirmation
+    awaitTxConfirmed (txId ledgerTx)
+
+    -- Log a message
+    logInfo @String "Funds locked"
